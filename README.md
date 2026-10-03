@@ -16,6 +16,75 @@ D2C merchant's support queue. The request is "let an agent read our Freshdesk", 
 the right tickets by order id or payment id, reading the full issue, and joining it with Razorpay data**
 without a human copying ids between tools. The tool surface is built around that.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph AS["Razorpay Agent Studio"]
+        A["Agent / LLM"]
+    end
+
+    subgraph C["Freshdesk connector (this repo)"]
+        direction TB
+        S["server.py<br/>8 read-only MCP tools<br/>typed schemas, readOnlyHint"]
+        B["Bearer-auth middleware<br/>(HTTP transport only)"]
+        Q["search.py<br/>validated query builder"]
+        M["models.py<br/>labels, truncation,<br/>PII masking"]
+        CL["client.py<br/>auth, retries, error mapping,<br/>Link-header pagination"]
+        RL["rate_limit.py<br/>token bucket synced to<br/>X-RateLimit headers"]
+        AU["auth.py + config.py<br/>API key from env or<br/>0600 credential file"]
+        S --> Q
+        S --> M
+        S --> CL
+        CL --> RL
+        CL --> AU
+    end
+
+    subgraph EXT["Freshdesk"]
+        F["REST API v2<br/>acme.freshdesk.com/api/v2"]
+    end
+
+    MK["mock.py<br/>synthetic Freshdesk<br/>with injected 429s"]
+
+    A -- "MCP over stdio" --> S
+    A -- "MCP over streamable HTTP<br/>Authorization: Bearer" --> B --> S
+    CL -- "HTTPS, Basic auth<br/>GET only" --> F
+    CL -. "--mock / tests" .-> MK
+```
+
+### Request flow for one tool call
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Server as MCP server
+    participant Client as FreshdeskClient
+    participant Limiter as Token bucket
+    participant FD as Freshdesk API
+
+    Agent->>Server: search_tickets(status, tags, payment_id)
+    Server->>Server: validate input, compile query<br/>(reject quotes, allow-listed fields)
+    Server->>Client: search_tickets(query, page)
+    loop until success or retry budget spent
+        Client->>Limiter: acquire a token
+        Limiter-->>Client: granted (waits if bucket empty)
+        Client->>FD: GET /search/tickets
+        alt 200 OK
+            FD-->>Client: results + X-RateLimit-Remaining
+            Client->>Limiter: sync remaining budget
+        else 429 Too Many Requests
+            FD-->>Client: Retry-After: N
+            Client->>Limiter: pause all callers for N seconds
+            Note over Client: if N exceeds the wait budget,<br/>return a rate-limited error to the agent
+        else 5xx or network error
+            Note over Client: exponential backoff with jitter,<br/>max 3 retries
+        end
+    end
+    Client-->>Server: raw JSON
+    Server->>Server: label statuses, truncate bodies,<br/>mask email and phone
+    Server-->>Agent: typed TicketPage<br/>(free text marked UNTRUSTED)
+```
+
 ## Quick start (no credentials needed)
 
 Requires Python 3.10+.
